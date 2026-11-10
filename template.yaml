@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Vendor payment feed processor (S3 -> Lambda -> SQS -> Lambda -> DynamoDB)
+
+Globals:
+  Function:
+    Runtime: java21
+    MemorySize: 512
+    Timeout: 60
+    Architectures: [arm64]
+    SnapStart:
+      ApplyOn: PublishedVersions   # faster Java cold starts
+    AutoPublishAlias: live
+    CodeUri: .
+
+Resources:
+
+  FeedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Explicit name so the function policy can reference it without a circular dependency.
+      # Bucket names must be lowercase, so use a lowercase stack name.
+      BucketName: !Sub '${AWS::StackName}-feeds-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  PaymentsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600   # 14 days to investigate failures
+
+  PaymentsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 360            # 6x the function timeout, as AWS recommends
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PaymentsDLQ.Arn
+        maxReceiveCount: 3
+
+  PaymentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: recordId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: recordId, KeyType: HASH }
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  FileSplitterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: io.github.vasurayudu.feeds.FileSplitterHandler::handleRequest
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref PaymentsQueue
+      Policies:                         # least privilege: read the bucket, send to one queue
+        - S3ReadPolicy: { BucketName: !Sub '${AWS::StackName}-feeds-${AWS::AccountId}' }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt PaymentsQueue.QueueName }
+      Events:
+        FileUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref FeedBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: incoming/ }
+
+  RecordProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: io.github.vasurayudu.feeds.RecordProcessorHandler::handleRequest
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PaymentsTable
+      Policies:                         # least privilege: write to one table only
+        - DynamoDBWritePolicy: { TableName: !Ref PaymentsTable }
+      Events:
+        Payments:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt PaymentsQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+Outputs:
+  BucketName:
+    Value: !Ref FeedBucket
+  TableName:
+    Value: !Ref PaymentsTable
+  DeadLetterQueueUrl:
+    Value: !Ref PaymentsDLQ

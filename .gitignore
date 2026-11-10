@@ -1,0 +1,24 @@
+# Build output
+target/
+build/
+dist/
+.gradle/
+.aws-sam/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# Dependencies
+node_modules/
+
+# Secrets — never commit
+.env
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
